@@ -429,6 +429,37 @@ async def cmd_start(m: types.Message):
         reply_markup=main_menu
     )
 
+@dp.message(Command("addadmin"))
+async def cmd_addadmin(m: types.Message):
+    if not await is_admin(m.from_user):
+        return await m.reply("Только администратор может добавлять других админов.")
+    parts = m.text.strip().split()
+    if len(parts) != 2:
+        return await m.reply("Использование: /addadmin user_id")
+    user_id = parts[1]
+    await add_admin(user_id)
+    await m.reply(f"Администратор {user_id} добавлен.")
+
+@dp.message(Command("removeadmin"))
+async def cmd_removeadmin(m: types.Message):
+    if not await is_admin(m.from_user):
+        return await m.reply("Только администратор может удалять админов.")
+    parts = m.text.strip().split()
+    if len(parts) != 2:
+        return await m.reply("Использование: /removeadmin user_id")
+    user_id = parts[1]
+    await remove_admin(user_id)
+    await m.reply(f"Администратор {user_id} удалён.")
+
+@dp.message(Command("admins"))
+async def cmd_admins(m: types.Message):
+    if not await is_admin(m.from_user):
+        return await m.reply("Только администратор.")
+    admins = await list_admins()
+    if not admins:
+        return await m.reply("Список админов пуст.")
+    await m.reply("Администраторы:\n" + "\n".join(admins))
+
 
 @dp.message(Command("help"))
 async def cmd_help(m: types.Message):
