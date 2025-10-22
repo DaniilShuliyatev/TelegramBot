@@ -13,6 +13,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
+import pytz
 
 # -------------------- Настройки --------------------
 load_dotenv()
@@ -24,13 +25,17 @@ DB_PATH = os.getenv("DB_PATH", "scheduler.db")
 if not API_TOKEN:
     raise RuntimeError("API_TOKEN not set in environment (.env)")
 
+# Таймзона Europe/Moscow (GMT+3)
+TZ = pytz.timezone("Europe/Moscow")
+
 # Без parse_mode="HTML", чтобы не ловить ошибки на <...>
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
 # -------------------- Утилиты --------------------
 def now_trunc_min() -> datetime:
-    return datetime.now().replace(second=0, microsecond=0)
+    # Текущее время в Europe/Moscow, обрезанные секунды/микросекунды
+    return datetime.now(TZ).replace(second=0, microsecond=0)
 
 def parse_chat_identifier(text: str) -> Optional[str]:
     text = text.strip()
@@ -48,7 +53,9 @@ def time_str_to_time(t_str: str) -> dtime:
     return dtime(hour=h, minute=m)
 
 def combine_date_time(d: datetime.date, t: dtime) -> datetime:
-    return datetime.combine(d, t)
+    # Локализуем к TZ, чтобы все сравнения/форматирования были консистентны
+    naive = datetime.combine(d, t)
+    return TZ.localize(naive)
 
 def schedule_to_str(sch: Dict[str, Any]) -> str:
     t = sch.get("type")
@@ -74,6 +81,7 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             identifier TEXT UNIQUE,
+            title TEXT,
             added_at TEXT)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,13 +106,13 @@ async def init_db():
             added_at TEXT)""")
         if ADMIN_ID:
             await db.execute("INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, ?)",
-                             (str(ADMIN_ID), datetime.now().isoformat()))
+                             (str(ADMIN_ID), now_trunc_min().isoformat()))
         await db.commit()
 
 async def add_admin(user_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, ?)",
-                         (user_id, datetime.now().isoformat()))
+                         (user_id, now_trunc_min().isoformat()))
         await db.commit()
 
 async def remove_admin(user_id: str):
@@ -123,23 +131,24 @@ async def is_admin(user: types.User) -> bool:
         cur = await db.execute("SELECT 1 FROM admins WHERE user_id = ?", (str(user.id),))
         return await cur.fetchone() is not None
 
-async def add_chat(identifier: str) -> bool:
+async def add_chat(identifier: str, title: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         try:
             await db.execute(
-                "INSERT INTO chats (identifier, added_at) VALUES (?, ?)",
-                (identifier, datetime.now().isoformat())
+                "INSERT INTO chats (identifier, title, added_at) VALUES (?, ?, ?)",
+                (identifier, title, now_trunc_min().isoformat())
             )
             await db.commit()
             return True
         except aiosqlite.IntegrityError:
             return False
 
-async def list_chats() -> List[str]:
+async def list_chats() -> List[Dict[str, str]]:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT identifier FROM chats ORDER BY id")
+        cur = await db.execute("SELECT identifier, title FROM chats ORDER BY id")
         rows = await cur.fetchall()
-        return [r[0] for r in rows]
+        return [{"identifier": r[0], "title": r[1] or r[0]} for r in rows]
+
 
 async def remove_chat(identifier: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -163,7 +172,7 @@ async def add_task(chats: List[str], text: str, file_id: Optional[str],
             "INSERT INTO tasks (chats, text, file_id, file_type, schedule, next_run, enabled, created_by, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (json.dumps(chats), text, file_id, file_type, json.dumps(schedule),
-             next_run_str, 1, created_by, datetime.now().isoformat())
+             next_run_str, 1, created_by, now_trunc_min().isoformat())
         )
         await db.commit()
         return cur.lastrowid
@@ -227,9 +236,31 @@ async def log_send(task_id: int, chat_identifier: str, status: str, info: str = 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO send_logs (task_id, chat_identifier, status, info, ts) VALUES (?, ?, ?, ?, ?)",
-            (task_id, chat_identifier, status, info, datetime.now().isoformat())
+            (task_id, chat_identifier, status, info, now_trunc_min().isoformat())
         )
         await db.commit()
+
+# -------------------- Кнопка отмены --------------------
+def cancel_kb():
+    return types.ReplyKeyboardMarkup(
+        keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+main_menu = types.ReplyKeyboardMarkup(
+    keyboard=[
+        [types.KeyboardButton(text="/addchat"), types.KeyboardButton(text="/chats")],
+        [types.KeyboardButton(text="/newtask"), types.KeyboardButton(text="/tasks")],
+        [types.KeyboardButton(text="/help")]
+    ],
+    resize_keyboard=True
+)
+
+@dp.message(F.text == "❌ Отмена")
+async def cancel_handler(m: types.Message, state: FSMContext):
+    await state.clear()
+    await m.reply("Действие отменено.", reply_markup=types.ReplyKeyboardRemove())
 
 # -------------------- Scheduler helpers --------------------
 def compute_next_run_from_schedule(schedule: Dict[str, Any], base_dt: Optional[datetime] = None) -> Optional[datetime]:
@@ -242,7 +273,9 @@ def compute_next_run_from_schedule(schedule: Dict[str, Any], base_dt: Optional[d
         dt_str = schedule.get("datetime")
         if not dt_str:
             return None
-        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+        # Парсим как локальное время Europe/Moscow
+        naive = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+        dt = TZ.localize(naive)
         return dt if dt >= base_dt else None
 
     if ttype == "daily":
@@ -297,18 +330,19 @@ def compute_next_run_from_schedule(schedule: Dict[str, Any], base_dt: Optional[d
                     continue
                 year, month = base_dt.year, base_dt.month
                 try:
-                    cand = datetime(year, month, int(day), tm.hour, tm.minute)
+                    cand = TZ.localize(datetime(year, month, int(day), tm.hour, tm.minute))
                     if cand >= base_dt:
                         candidates.append(cand)
                     else:
                         nxt = (datetime(year, month, 1) + relativedelta(months=1))
-                        cand2 = datetime(nxt.year, nxt.month, int(day), tm.hour, tm.minute)
+                        cand2 = TZ.localize(datetime(nxt.year, nxt.month, int(day), tm.hour, tm.minute))
                         candidates.append(cand2)
                 except Exception:
+                    # если день не существует в месяце — пробуем дальше
                     for i in range(1, 13):
                         nxt = (datetime(year, month, 1) + relativedelta(months=i))
                         try:
-                            cand2 = datetime(nxt.year, nxt.month, int(day), tm.hour, tm.minute)
+                            cand2 = TZ.localize(datetime(nxt.year, nxt.month, int(day), tm.hour, tm.minute))
                             if cand2 >= base_dt:
                                 candidates.append(cand2)
                                 break
@@ -383,7 +417,7 @@ class NewTask(StatesGroup):
 async def cmd_start(m: types.Message):
     await m.reply(
         "Привет! Я бот-рассыльщик.\n"
-        "Команды (админы):\n"
+        "Вот список команд:\n"
         "/addchat — добавить чат\n"
         "/chats — список чатов\n"
         "/removechat — удалить чат\n"
@@ -391,83 +425,51 @@ async def cmd_start(m: types.Message):
         "/tasks — показать задачи\n"
         "/addadmin user_id — добавить администратора\n"
         "/removeadmin user_id — убрать администратора\n"
-        "/admins — список админов"
+        "/admins — список админов",
+        reply_markup=main_menu
     )
+
 
 @dp.message(Command("help"))
 async def cmd_help(m: types.Message):
     await cmd_start(m)
 
-@dp.message(Command("addadmin"))
-async def cmd_addadmin(m: types.Message):
-    if not await is_admin(m.from_user):
-        return await m.reply("Нет прав.")
-    parts = m.text.split()
-    if len(parts) < 2:
-        return await m.reply("Использование: /addadmin user_id")
-    await add_admin(parts[1])
-    await m.reply(f"Пользователь {parts[1]} теперь администратор.")
+# -------------------- States для чатов --------------------
+class ChatStates(StatesGroup):
+    entering_identifier = State()
+    entering_title = State()
+    removing_identifier = State()
 
-@dp.message(Command("removeadmin"))
-async def cmd_removeadmin(m: types.Message):
-    if not await is_admin(m.from_user):
-        return await m.reply("Нет прав.")
-    parts = m.text.split()
-    if len(parts) < 2:
-        return await m.reply("Использование: /removeadmin user_id")
-    await remove_admin(parts[1])
-    await m.reply(f"Пользователь {parts[1]} больше не администратор.")
-
-@dp.message(Command("admins"))
-async def cmd_admins(m: types.Message):
-    if not await is_admin(m.from_user):
-        return await m.reply("Нет прав.")
-    admins = await list_admins()
-    if not admins:
-        return await m.reply("Список администраторов пуст.")
-    await m.reply("Администраторы:\n" + "\n".join(admins))
-
-# -------------------- Команды: чаты --------------------
+# -------------------- Добавление чата --------------------
 @dp.message(Command("addchat"))
 async def cmd_addchat(m: types.Message, state: FSMContext):
     if not await is_admin(m.from_user):
         return await m.reply("Только администратор.")
-    await m.reply("Отправь идентификатор чата: @username, https://t.me/username или -100... (ID)")
-    await state.set_state(NewTask.entering_manual)
-    await state.update_data(mode="addchat")
+    await m.reply("Отправь идентификатор чата: @username, https://t.me/username или -100... (ID)",
+                  reply_markup=cancel_kb())
+    await state.set_state(ChatStates.entering_identifier)
 
-@dp.message(NewTask.entering_manual)
-async def handle_addchat_or_manual(m: types.Message, state: FSMContext):
+@dp.message(ChatStates.entering_identifier)
+async def handle_addchat_identifier(m: types.Message, state: FSMContext):
+    parsed = parse_chat_identifier(m.text.strip())
+    if not parsed:
+        return await m.reply("Не распознал идентификатор. Попробуй ещё раз.", reply_markup=cancel_kb())
+    await state.update_data(identifier=parsed)
+    await m.reply("Теперь введи название для этого чата (например: 'Рабочая группа').",
+                  reply_markup=cancel_kb())
+    await state.set_state(ChatStates.entering_title)
+
+@dp.message(ChatStates.entering_title)
+async def handle_addchat_title(m: types.Message, state: FSMContext):
     data = await state.get_data()
-    mode = data.get("mode")
-    if mode == "addchat":
-        parsed = parse_chat_identifier(m.text.strip())
-        if not parsed:
-            return await m.reply("Не распознал идентификатор. Попробуй ещё раз.")
-        cnt = await count_chats()
-        if cnt >= 150:
-            await m.reply("Достигнут лимит 150 чатов.")
-            await state.clear()
-            return
-        ok = await add_chat(parsed)
-        await m.reply("Добавлен" if ok else "Уже есть")
-        await state.clear()
-        return
-    # ручной ввод для newtask
-    parts = [p.strip() for p in m.text.split(",")]
-    parsed_list = []
-    for p in parts:
-        pp = parse_chat_identifier(p)
-        if pp:
-            parsed_list.append(pp)
-    if not parsed_list:
-        return await m.reply("Не распознал чаты. Попробуй ещё раз.")
-    if len(parsed_list) > 150:
-        return await m.reply("Нельзя более 150 чатов.")
-    await state.update_data(chats=parsed_list)
-    await m.reply("Теперь пришли текст сообщения или отправь медиа. Подпись к медиа станет текстом.")
-    await state.set_state(NewTask.entering_content)
+    identifier = data["identifier"]
+    title = m.text.strip()
+    ok = await add_chat(identifier, title)
+    await m.reply(f"Чат {title} ({identifier}) {'добавлен' if ok else 'уже есть'}",
+                  reply_markup=types.ReplyKeyboardRemove())
+    await state.clear()
 
+# -------------------- Список чатов --------------------
 @dp.message(Command("chats"))
 async def cmd_chats(m: types.Message):
     if not await is_admin(m.from_user):
@@ -475,29 +477,27 @@ async def cmd_chats(m: types.Message):
     chats = await list_chats()
     if not chats:
         return await m.reply("Список чатов пуст.")
-    await m.reply("Список чатов:\n\n" + "\n".join(f"{i+1}. {c}" for i, c in enumerate(chats)))
+    await m.reply("Список чатов:\n\n" + "\n".join(
+        f"{i+1}. {c['title']} ({c['identifier']})" for i, c in enumerate(chats)
+    ))
 
+# -------------------- Удаление чата --------------------
 @dp.message(Command("removechat"))
 async def cmd_removechat(m: types.Message, state: FSMContext):
     if not await is_admin(m.from_user):
         return await m.reply("Только администратор.")
-    await m.reply("Отправь идентификатор чата для удаления.")
-    await state.set_state(NewTask.entering_manual)
-    await state.update_data(mode="removechat")
+    await m.reply("Отправь идентификатор чата для удаления.", reply_markup=cancel_kb())
+    await state.set_state(ChatStates.removing_identifier)
 
-@dp.message(NewTask.entering_manual)
-async def handle_removechat_or_manual(m: types.Message, state: FSMContext):
-    data = await state.get_data()
-    mode = data.get("mode")
-    if mode == "removechat":
-        parsed = parse_chat_identifier(m.text.strip())
-        if not parsed:
-            return await m.reply("Не распознал идентификатор.")
-        await remove_chat(parsed)
-        await m.reply(f"Удалён: {parsed}")
-        await state.clear()
-        return
-    return
+@dp.message(ChatStates.removing_identifier)
+async def handle_removechat(m: types.Message, state: FSMContext):
+    parsed = parse_chat_identifier(m.text.strip())
+    if not parsed:
+        return await m.reply("Не распознал идентификатор.", reply_markup=cancel_kb())
+    await remove_chat(parsed)
+    await m.reply(f"Удалён: {parsed}", reply_markup=types.ReplyKeyboardRemove())
+    await state.clear()
+
 
 # -------------------- New task creation flow (FSM) --------------------
 @dp.message(Command("newtask"))
@@ -508,6 +508,7 @@ async def cmd_newtask(m: types.Message, state: FSMContext):
         keyboard=[
             [types.KeyboardButton(text="Выбрать из добавленных")],
             [types.KeyboardButton(text="Ввести вручную")],
+            [types.KeyboardButton(text="❌ Отмена")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True
@@ -517,22 +518,27 @@ async def cmd_newtask(m: types.Message, state: FSMContext):
 
 @dp.message(NewTask.choosing_source)
 async def newtask_choose_source(m: types.Message, state: FSMContext):
-    await m.answer("Ок", reply_markup=types.ReplyKeyboardRemove())
     if m.text == "Выбрать из добавленных":
         chats = await list_chats()
         if not chats:
-            await m.reply("Список добавленных пуст. Сначала добавь чаты через /addchat.")
+            await m.reply("Список добавленных пуст. Сначала добавь чаты через /addchat.",
+                          reply_markup=types.ReplyKeyboardRemove())
             await state.clear()
             return
         await state.update_data(all_chats=chats)
         text = "Список чатов:\n" + "\n".join(f"{i+1}. {c}" for i, c in enumerate(chats))
         text += "\nОтправь номера через запятую (например: 1,2,5) или 'all'."
-        await m.reply(text)
+        await m.reply(text, reply_markup=cancel_kb())
         await state.set_state(NewTask.choosing_from_list)
-    else:
-        await m.reply("Введи идентификаторы через запятую (например: @a, -100123, https://t.me/b)")
+    elif m.text == "Ввести вручную":
+        await m.reply("Введи идентификаторы через запятую (например: @a, -100123, https://t.me/b)",
+                      reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_manual)
         await state.update_data(mode="newtask_manual")
+    else:
+        await m.answer("Ок", reply_markup=types.ReplyKeyboardRemove())
+        await m.reply("Неверный выбор. Отмена.")
+        await state.clear()
 
 @dp.message(NewTask.choosing_from_list)
 async def newtask_chats_selected_from_list(m: types.Message, state: FSMContext):
@@ -540,39 +546,39 @@ async def newtask_chats_selected_from_list(m: types.Message, state: FSMContext):
     data = await state.get_data()
     chats = data.get("all_chats", [])
     selected = []
-
     if raw.lower() == "all":
-        selected = chats
+        selected = [c["identifier"] for c in chats]
     else:
         parts = [p.strip() for p in raw.split(",")]
         for p in parts:
             if p.isdigit():
                 idx = int(p) - 1
                 if 0 <= idx < len(chats):
-                    selected.append(chats[idx])
+                    selected.append(chats[idx]["identifier"])
             elif "-" in p:
                 try:
                     a, b = map(int, p.split("-", 1))
                     for i in range(a - 1, b):
                         if 0 <= i < len(chats):
-                            selected.append(chats[i])
+                            selected.append(chats[i]["identifier"])
                 except:
                     pass
 
     if not selected:
-        await m.reply("Не выбрано ни одного чата. Отмена.")
+        await m.reply("Не выбрано ни одного чата. Отмена.", reply_markup=types.ReplyKeyboardRemove())
         await state.clear()
         return
 
-    await state.update_data(chats=selected)
-    await m.reply("Теперь пришли текст сообщения или отправь медиа. Подпись к медиа станет текстом.")
+    await state.update_data(chats=selected)   # теперь список строк
+
+    await m.reply("Теперь пришли текст сообщения или отправь медиа. Подпись к медиа станет текстом.",
+                  reply_markup=cancel_kb())
     await state.set_state(NewTask.entering_content)
 
 @dp.message(NewTask.entering_content)
 async def newtask_get_content(m: types.Message, state: FSMContext):
     file_id, file_type = None, None
     text = m.caption if m.caption else (m.text if m.text else "")
-
     if m.photo:
         file_id = m.photo[-1].file_id; file_type = "photo"
     elif m.video:
@@ -583,9 +589,7 @@ async def newtask_get_content(m: types.Message, state: FSMContext):
         file_id = m.audio.file_id; file_type = "audio"
     elif m.voice:
         file_id = m.voice.file_id; file_type = "voice"
-
     await state.update_data(text=text, file_id=file_id, file_type=file_type)
-
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="Разово (один раз)")],
@@ -594,6 +598,7 @@ async def newtask_get_content(m: types.Message, state: FSMContext):
             [types.KeyboardButton(text="Еженедельно")],
             [types.KeyboardButton(text="Ежемесячно")],
             [types.KeyboardButton(text="Будни / Выходные")],
+            [types.KeyboardButton(text="❌ Отмена")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True
@@ -603,53 +608,51 @@ async def newtask_get_content(m: types.Message, state: FSMContext):
 
 @dp.message(NewTask.choosing_schedule_type)
 async def newtask_choose_schedule_type(m: types.Message, state: FSMContext):
-    await m.answer("Ок", reply_markup=types.ReplyKeyboardRemove())
     t = m.text
-
     if t == "Разово (один раз)":
-        await m.reply("Введите дату и время: YYYY-MM-DD HH:MM (например: 2025-10-30 18:30)")
+        await m.reply("Введите дату и время: YYYY-MM-DD HH:MM (например: 2025-10-30 18:30)",
+                      reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_once)
-
     elif t == "Ежедневно":
-        await m.reply("Введите время: HH:MM (например: 09:00)")
+        await m.reply("Введите время: HH:MM (например: 09:00)", reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_daily)
-
     elif t == "Несколько раз в день":
-        await m.reply("Введите времена через запятую: HH:MM,HH:MM (например: 09:00,13:30,20:00)")
+        await m.reply("Введите времена через запятую: HH:MM,HH:MM (например: 09:00,13:30,20:00)",
+                      reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_multiple_daily)
-
     elif t == "Еженедельно":
-        await m.reply("Введите дни недели и время. Пример: mon,wed,fri 09:00\nДни: mon,tue,wed,thu,fri,sat,sun")
+        await m.reply("Введите дни недели и время. Пример: mon,wed,fri 09:00\nДни: mon,tue,wed,thu,fri,sat,sun",
+                      reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_weekly)
-
     elif t == "Ежемесячно":
-        await m.reply("Введите числа месяца и время. Пример: 1,15 09:00")
+        await m.reply("Введите числа месяца и время. Пример: 1,15 09:00", reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_monthly)
-
     elif t == "Будни / Выходные":
         kb = types.ReplyKeyboardMarkup(
             keyboard=[
                 [types.KeyboardButton(text="Будни (Mon-Fri)")],
                 [types.KeyboardButton(text="Выходные (Sat-Sun)")],
+                [types.KeyboardButton(text="❌ Отмена")],
             ],
             resize_keyboard=True,
             one_time_keyboard=True
         )
         await m.reply("Выбери вариант:", reply_markup=kb)
         await state.set_state(NewTask.choosing_weekmode)
-
     else:
-        await m.reply("Неверный выбор. Отмена.")
+        await m.reply("Неверный выбор. Отмена.", reply_markup=types.ReplyKeyboardRemove())
         await state.clear()
 
 @dp.message(NewTask.entering_once)
 async def newtask_schedule_once(m: types.Message, state: FSMContext):
     txt = m.text.strip()
     try:
-        dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
+        naive = datetime.strptime(txt, "%Y-%m-%d %H:%M")
+        dt = TZ.localize(naive)
     except:
-        await m.reply("Неверный формат. Попробуйте ещё раз.")
+        await m.reply("Неверный формат. Попробуйте ещё раз.", reply_markup=cancel_kb())
         return
+    # храним строку в локальном формате (YYYY-MM-DD HH:MM)
     schedule = {"type": "once", "datetime": dt.strftime("%Y-%m-%d %H:%M")}
     await finalize_newtask(m, state, schedule)
 
@@ -659,7 +662,7 @@ async def newtask_schedule_daily(m: types.Message, state: FSMContext):
     try:
         _ = time_str_to_time(txt)
     except:
-        await m.reply("Неверный формат времени.")
+        await m.reply("Неверный формат времени.", reply_markup=cancel_kb())
         return
     schedule = {"type": "daily", "time": txt}
     await finalize_newtask(m, state, schedule)
@@ -671,7 +674,7 @@ async def newtask_schedule_multiple_daily(m: types.Message, state: FSMContext):
         for p in parts:
             _ = time_str_to_time(p)
     except:
-        await m.reply("Неверный формат времен.")
+        await m.reply("Неверный формат времен.", reply_markup=cancel_kb())
         return
     schedule = {"type": "multiple_daily", "times": parts}
     await finalize_newtask(m, state, schedule)
@@ -685,7 +688,7 @@ async def newtask_schedule_weekly(m: types.Message, state: FSMContext):
         schedule = {"type": "weekly", "days": days, "times": [time_part.strip()]}
         await finalize_newtask(m, state, schedule)
     except:
-        await m.reply("Неверный формат. Пример: mon,wed,fri 09:00")
+        await m.reply("Неверный формат. Пример: mon,wed,fri 09:00", reply_markup=cancel_kb())
 
 @dp.message(NewTask.entering_monthly)
 async def newtask_schedule_monthly(m: types.Message, state: FSMContext):
@@ -696,21 +699,21 @@ async def newtask_schedule_monthly(m: types.Message, state: FSMContext):
         schedule = {"type": "monthly", "days": days, "times": [time_part.strip()]}
         await finalize_newtask(m, state, schedule)
     except:
-        await m.reply("Неверный формат. Пример: 1,15 09:00")
+        await m.reply("Неверный формат. Пример: 1,15 09:00", reply_markup=cancel_kb())
 
 @dp.message(NewTask.choosing_weekmode)
 async def newtask_schedule_weekdays_weekends(m: types.Message, state: FSMContext):
     choice = m.text.strip()
     if choice == "Будни (Mon-Fri)":
         await state.update_data(weekmode="weekdays")
-        await m.reply("Введите время: HH:MM")
+        await m.reply("Введите время: HH:MM", reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_weekmode_time)
     elif choice == "Выходные (Sat-Sun)":
         await state.update_data(weekmode="weekends")
-        await m.reply("Введите время: HH:MM")
+        await m.reply("Введите время: HH:MM", reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_weekmode_time)
     else:
-        await m.reply("Неверный выбор. Отмена.")
+        await m.reply("Неверный выбор. Отмена.", reply_markup=types.ReplyKeyboardRemove())
         await state.clear()
 
 @dp.message(NewTask.entering_weekmode_time)
@@ -719,7 +722,7 @@ async def finalize_newtask_from_weekmode(m: types.Message, state: FSMContext):
     try:
         _ = time_str_to_time(txt)
     except:
-        await m.reply("Неверный формат времени.")
+        await m.reply("Неверный формат времени.", reply_markup=cancel_kb())
         return
     data = await state.get_data()
     mode = data.get("weekmode")
@@ -735,19 +738,20 @@ async def finalize_newtask(m: types.Message, state: FSMContext, schedule: Dict[s
     created_by = m.from_user.id
 
     if not chats:
-        await m.reply("Чаты для рассылки не выбраны. Отмена.")
+        await m.reply("Чаты для рассылки не выбраны. Отмена.", reply_markup=types.ReplyKeyboardRemove())
         await state.clear()
         return
 
     task_id = await add_task(chats, text, file_id, file_type, schedule, created_by)
     next_run = compute_next_run_from_schedule(schedule)
+    next_run_str = next_run.strftime("%Y-%m-%d %H:%M") if next_run else "—"
     await m.reply(
         f"Задача #{task_id} создана.\n"
         f"Расписание: {schedule_to_str(schedule)}\n"
-        f"Следующий запуск: {next_run}"
+        f"Следующий запуск: {next_run_str}",
+        reply_markup=types.ReplyKeyboardRemove()
     )
     await state.clear()
-
 # -------------------- Tasks: список и действия --------------------
 @dp.message(Command("tasks"))
 async def cmd_tasks(m: types.Message):
@@ -761,17 +765,19 @@ async def cmd_tasks(m: types.Message):
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{t['id']}"),
              InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{t['id']}")],
             [InlineKeyboardButton(text="🚀 Отправить сейчас", callback_data=f"sendnow:{t['id']}"),
-             InlineKeyboardButton(text=("⏸ Включено" if t['enabled'] else "▶️ Включить"), callback_data=f"toggle:{t['id']}")]
+             InlineKeyboardButton(text=("⏸ Включено" if t['enabled'] else "▶️ Включить"),
+                                  callback_data=f"toggle:{t['id']}")]
         ])
         info = (
             f"ID: {t['id']}\n"
-            f"Чаты: {', '.join(t['chats'])}\n"
-            f"Текст: {t['text'][:200] + ('...' if len(t['text'])>200 else '')}\n"
+            f"Чаты: {', '.join(chat_titles)}\n"
+            f"Текст: {t['text'][:200] + ('...' if len(t['text']) > 200 else '')}\n"
             f"Медиа: {'Да' if t['file_id'] else 'Нет'}\n"
             f"Schedule: {schedule_to_str(t['schedule'])}\n"
             f"Next run: {t['next_run']}\n"
             f"Enabled: {t['enabled']}"
         )
+
         await m.reply(info, reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("delete:"))
@@ -797,7 +803,6 @@ async def cb_sendnow(call: types.CallbackQuery):
     task = await get_task(task_id)
     if not task:
         return await call.answer("Задача не найдена", show_alert=True)
-
     success, failed = 0, 0
     for ch in task["chats"]:
         ok, info = await send_message_to_chat(ch, task["text"], task["file_id"], task["file_type"])
@@ -807,135 +812,18 @@ async def cb_sendnow(call: types.CallbackQuery):
         else:
             failed += 1
             await log_send(task_id, ch, "error", info)
-
     await call.message.answer(f"Отправлено: {success}, Ошибок: {failed}")
     await call.answer("Отправлено сейчас")
 
-@dp.callback_query(F.data.startswith("edit:"))
-async def cb_edit(call: types.CallbackQuery):
-    task_id = int(call.data.split(":", 1)[1])
-    task = await get_task(task_id)
-    if not task:
-        return await call.answer("Не найдено", show_alert=True)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить текст/подпись", callback_data=f"edittext:{task_id}")],
-        [InlineKeyboardButton(text="📎 Заменить/удалить медиа", callback_data=f"editmedia:{task_id}")],
-        [InlineKeyboardButton(text="📌 Изменить чаты", callback_data=f"editchats:{task_id}")],
-        [InlineKeyboardButton(text="⏰ Изменить расписание", callback_data=f"editschedule:{task_id}")],
-    ])
-    await call.message.answer(f"Редактирование задачи {task_id}:", reply_markup=kb)
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("edittext:"))
-async def cb_edittext(call: types.CallbackQuery):
-    task_id = int(call.data.split(":", 1)[1])
-    await call.message.answer("Отправь новый текст/подпись для задачи.")
-    async def handle_edit_text(msg: types.Message):
-        new_text = msg.text or ""
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE tasks SET text = ? WHERE id = ?", (new_text, task_id))
-            await db.commit()
-        await msg.reply("Текст обновлён.")
-    dp.message.register(handle_edit_text, F.chat.id == call.message.chat.id)
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("editmedia:"))
-async def cb_editmedia(call: types.CallbackQuery):
-    task_id = int(call.data.split(":", 1)[1])
-    await call.message.answer("Пришли новое медиа (фото/видео/документ/аудио/голос) или напиши 'delete' чтобы удалить медиа.")
-    async def handle_edit_media(msg: types.Message):
-        if msg.text and msg.text.lower().strip() == "delete":
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE tasks SET file_id = NULL, file_type = NULL WHERE id = ?", (task_id,))
-                await db.commit()
-            await msg.reply("Медиа удалено.")
-            return
-        file_id, file_type = None, None
-        if msg.photo:
-            file_id = msg.photo[-1].file_id; file_type="photo"
-        elif msg.video:
-            file_id = msg.video.file_id; file_type="video"
-        elif msg.document:
-            file_id = msg.document.file_id; file_type="document"
-        elif msg.audio:
-            file_id = msg.audio.file_id; file_type="audio"
-        elif msg.voice:
-            file_id = msg.voice.file_id; file_type="voice"
-        if not file_id:
-            await msg.reply("Не распознал медиа. Отправь корректный файл или 'delete'.")
-            return
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE tasks SET file_id = ?, file_type = ? WHERE id = ?", (file_id, file_type, task_id))
-            await db.commit()
-        await msg.reply("Медиа обновлено.")
-    dp.message.register(handle_edit_media, F.chat.id == call.message.chat.id)
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("editchats:"))
-async def cb_editchats(call: types.CallbackQuery):
-    task_id = int(call.data.split(":", 1)[1])
-    await call.message.answer("Введи новые чаты через запятую (идентификаторы) или 'list' чтобы выбрать из добавленных.")
-    async def handle_edit_chats(msg: types.Message):
-        raw = msg.text.strip()
-        if raw.lower() == "list":
-            chats = await list_chats()
-            if not chats:
-                await msg.reply("Добавленных чатов нет.")
-                return
-            text = "Добавленные чаты:\n" + "\n".join(f"{i+1}. {c}" for i, c in enumerate(chats))
-            text += "\nОтправь номера через запятую или 'all'."
-            await msg.reply(text)
-            async def handle_edit_chats_list(mm: types.Message):
-                r = mm.text.strip()
-                selected = []
-                if r.lower() == "all":
-                    selected = chats
-                else:
-                    for p in [x.strip() for x in r.split(",")]:
-                        if p.isdigit():
-                            idx = int(p)-1
-                            if 0 <= idx < len(chats):
-                                selected.append(chats[idx])
-                if not selected:
-                    await mm.reply("Ничего не выбрано.")
-                    return
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE tasks SET chats = ? WHERE id = ?", (json.dumps(selected), task_id))
-                    await db.commit()
-                await mm.reply("Чаты обновлены.")
-            dp.message.register(handle_edit_chats_list, F.chat.id == msg.chat.id)
-            return
-        parts = [p.strip() for p in raw.split(",")]
-        parsed = []
-        for p in parts:
-            pp = parse_chat_identifier(p)
-            if pp:
-                parsed.append(pp)
-        if not parsed:
-            await msg.reply("Не распознал чаты.")
-            return
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE tasks SET chats = ? WHERE id = ?", (json.dumps(parsed), task_id))
-            await db.commit()
-        await msg.reply("Чаты обновлены.")
-    dp.message.register(handle_edit_chats, F.chat.id == call.message.chat.id)
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("editschedule:"))
-async def cb_editschedule(call: types.CallbackQuery):
-    task_id = int(call.data.split(":", 1)[1])
-    await call.message.answer("Чтобы изменить расписание, удалите задачу и создайте новую. (Редактор расписания — в разработке.)")
-    await call.answer()
-
-# -------------------- Scheduler loop --------------------
+# -------------------- Планировщик --------------------
 async def scheduler_loop():
     while True:
         try:
             now = now_trunc_min()
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute(
-                    "SELECT id, chats, text, file_id, file_type, schedule, next_run FROM tasks WHERE enabled = 1 AND next_run IS NOT NULL"
+                    "SELECT id, chats, text, file_id, file_type, schedule, next_run FROM tasks "
+                    "WHERE enabled = 1 AND next_run IS NOT NULL"
                 )
                 rows = await cur.fetchall()
                 for r in rows:
@@ -949,23 +837,21 @@ async def scheduler_loop():
                     if not next_run_str:
                         continue
                     try:
-                        next_run_dt = datetime.strptime(next_run_str, "%Y-%m-%d %H:%M")
+                        next_run_dt = TZ.localize(datetime.strptime(next_run_str, "%Y-%m-%d %H:%M"))
                     except:
                         continue
-
                     if next_run_dt <= now:
                         for ch in chats:
                             ok, info = await send_message_to_chat(ch, text, file_id, file_type)
                             await log_send(task_id, ch, "ok" if ok else "error", info)
-
                         ttype = schedule.get("type")
                         if ttype == "once":
                             await update_task_next_run(task_id, None)
                             await set_task_enabled(task_id, False)
                         else:
-                            nxt = compute_next_run_from_schedule(schedule, base_dt=next_run_dt + timedelta(minutes=1))
+                            nxt = compute_next_run_from_schedule(schedule,
+                                                                 base_dt=next_run_dt + timedelta(minutes=1))
                             await update_task_next_run(task_id, nxt)
-
             await asyncio.sleep(20)
         except Exception as ex:
             print("Scheduler error:", ex)
