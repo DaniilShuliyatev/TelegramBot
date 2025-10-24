@@ -517,17 +517,39 @@ async def cmd_chats(m: types.Message):
 async def cmd_removechat(m: types.Message, state: FSMContext):
     if not await is_admin(m.from_user):
         return await m.reply("Только администратор.")
-    await m.reply("Отправь идентификатор чата для удаления.", reply_markup=cancel_kb())
+
+    chats = await list_chats()
+    if not chats:
+        return await m.reply("Список чатов пуст.")
+
+    # Сохраняем список в state, чтобы потом по номеру найти
+    await state.update_data(all_chats=chats)
+
+    text = "Список чатов:\n" + "\n".join(
+        f"{i+1}. {c['title']} ({c['identifier']})" for i, c in enumerate(chats)
+    ) + "\n\nОтправь номер чата для удаления."
+    await m.reply(text, reply_markup=cancel_kb())
     await state.set_state(ChatStates.removing_identifier)
+
 
 @dp.message(ChatStates.removing_identifier)
 async def handle_removechat(m: types.Message, state: FSMContext):
-    parsed = parse_chat_identifier(m.text.strip())
-    if not parsed:
-        return await m.reply("Не распознал идентификатор.", reply_markup=cancel_kb())
-    await remove_chat(parsed)
-    await m.reply(f"Удалён: {parsed}", reply_markup=types.ReplyKeyboardRemove())
+    data = await state.get_data()
+    chats = data.get("all_chats", [])
+
+    if not m.text.isdigit():
+        return await m.reply("Нужно ввести номер из списка.", reply_markup=cancel_kb())
+
+    idx = int(m.text) - 1
+    if idx < 0 or idx >= len(chats):
+        return await m.reply("Некорректный номер.", reply_markup=cancel_kb())
+
+    chat = chats[idx]
+    await remove_chat(chat["identifier"])
+    await m.reply(f"Удалён: {chat['title']} ({chat['identifier']})",
+                  reply_markup=types.ReplyKeyboardRemove())
     await state.clear()
+
 
 
 # -------------------- New task creation flow (FSM) --------------------
@@ -557,7 +579,7 @@ async def newtask_choose_source(m: types.Message, state: FSMContext):
             await state.clear()
             return
         await state.update_data(all_chats=chats)
-        text = "Список чатов:\n" + "\n".join(f"{i+1}. {c}" for i, c in enumerate(chats))
+        text = "Список чатов:\n" + "\n".join(f"{i+1}. {c['title']}" for i, c in enumerate(chats))
         text += "\nОтправь номера через запятую (например: 1,2,5) или 'all'."
         await m.reply(text, reply_markup=cancel_kb())
         await state.set_state(NewTask.choosing_from_list)
@@ -788,10 +810,19 @@ async def finalize_newtask(m: types.Message, state: FSMContext, schedule: Dict[s
 async def cmd_tasks(m: types.Message):
     if not await is_admin(m.from_user):
         return await m.reply("Только администратор.")
+
     tasks = await list_tasks_db()
     if not tasks:
         return await m.reply("Нет задач.")
+
+    # Загружаем список чатов для отображения названий
+    all_chats = await list_chats()
+    title_by_id = {c["identifier"]: (c["title"] or c["identifier"]) for c in all_chats}
+
     for t in tasks:
+        # преобразуем идентификаторы в названия
+        chat_titles = [title_by_id.get(cid, cid) for cid in t["chats"]]
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{t['id']}"),
              InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{t['id']}")],
@@ -799,6 +830,7 @@ async def cmd_tasks(m: types.Message):
              InlineKeyboardButton(text=("⏸ Включено" if t['enabled'] else "▶️ Включить"),
                                   callback_data=f"toggle:{t['id']}")]
         ])
+
         info = (
             f"ID: {t['id']}\n"
             f"Чаты: {', '.join(chat_titles)}\n"
@@ -810,6 +842,7 @@ async def cmd_tasks(m: types.Message):
         )
 
         await m.reply(info, reply_markup=kb)
+
 
 @dp.callback_query(F.data.startswith("delete:"))
 async def cb_delete(call: types.CallbackQuery):
