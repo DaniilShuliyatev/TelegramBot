@@ -250,12 +250,13 @@ def cancel_kb():
 
 main_menu = types.ReplyKeyboardMarkup(
     keyboard=[
-        [types.KeyboardButton(text="/addchat"), types.KeyboardButton(text="/chats")],
-        [types.KeyboardButton(text="/newtask"), types.KeyboardButton(text="/tasks")],
-        [types.KeyboardButton(text="/help")]
+        [types.KeyboardButton(text="➕ Добавить чат"), types.KeyboardButton(text="📋 Список чатов")],
+        [types.KeyboardButton(text="🆕 Новая задача"), types.KeyboardButton(text="📌 Задачи")],
+        [types.KeyboardButton(text="ℹ️ Помощь")]
     ],
     resize_keyboard=True
 )
+
 
 @dp.message(F.text == "❌ Отмена")
 async def cancel_handler(m: types.Message, state: FSMContext):
@@ -376,26 +377,30 @@ def compute_next_run_from_schedule(schedule: Dict[str, Any], base_dt: Optional[d
 
 # -------------------- Message sending --------------------
 async def send_message_to_chat(chat_identifier: str, text: str,
-                               file_id: Optional[str], file_type: Optional[str]) -> (bool, str):
+                                file_id: Optional[str], file_type: Optional[str]) -> (bool, str):
     try:
         if file_id:
             if file_type == "photo":
-                await bot.send_photo(chat_identifier, file_id, caption=text or "")
+                await bot.send_photo(chat_identifier, file_id, caption=text or "", parse_mode="HTML")
             elif file_type == "video":
-                await bot.send_video(chat_identifier, file_id, caption=text or "")
+                await bot.send_video(chat_identifier, file_id, caption=text or "", parse_mode="HTML")
             elif file_type == "document":
-                await bot.send_document(chat_identifier, file_id, caption=text or "")
+                await bot.send_document(chat_identifier, file_id, caption=text or "", parse_mode="HTML")
             elif file_type == "audio":
-                await bot.send_audio(chat_identifier, file_id, caption=text or "")
+                await bot.send_audio(chat_identifier, file_id, caption=text or "", parse_mode="HTML")
             elif file_type == "voice":
-                await bot.send_voice(chat_identifier, file_id, caption=text or "")
+                await bot.send_voice(chat_identifier, file_id, caption=text or "", parse_mode="HTML")
+            elif file_type == "sticker":
+                await bot.send_sticker(chat_identifier, file_id)
             else:
-                await bot.send_message(chat_identifier, text or "")
+                await bot.send_message(chat_identifier, text or "", parse_mode="HTML")
         else:
-            await bot.send_message(chat_identifier, text or "")
+            await bot.send_message(chat_identifier, text or "", parse_mode="HTML")
+
         return True, "ok"
     except Exception as e:
         return False, str(e)
+
 
 # -------------------- FSM States --------------------
 class NewTask(StatesGroup):
@@ -416,18 +421,29 @@ class NewTask(StatesGroup):
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     await m.reply(
-        "Привет! Я бот-рассыльщик.\n"
-        "Вот список команд:\n"
-        "/addchat — добавить чат\n"
-        "/chats — список чатов\n"
-        "/removechat — удалить чат\n"
-        "/newtask — создать задачу\n"
-        "/tasks — показать задачи\n"
-        "/addadmin user_id — добавить администратора\n"
-        "/removeadmin user_id — убрать администратора\n"
-        "/admins — список админов",
+        "Привет! Я бот-рассыльщик.\nВыберите действие:",
         reply_markup=main_menu
     )
+@dp.message(F.text == "➕ Добавить чат")
+async def btn_addchat(m: types.Message, state: FSMContext):
+    await cmd_addchat(m, state)
+
+@dp.message(F.text == "📋 Список чатов")
+async def btn_chats(m: types.Message):
+    await cmd_chats(m)
+
+@dp.message(F.text == "🆕 Новая задача")
+async def btn_newtask(m: types.Message, state: FSMContext):
+    await cmd_newtask(m, state)
+
+@dp.message(F.text == "📌 Задачи")
+async def btn_tasks(m: types.Message):
+    await cmd_tasks(m)
+
+@dp.message(F.text == "ℹ️ Помощь")
+async def btn_help(m: types.Message):
+    await cmd_help(m)
+
 
 @dp.message(Command("addadmin"))
 async def cmd_addadmin(m: types.Message):
@@ -642,6 +658,9 @@ async def newtask_get_content(m: types.Message, state: FSMContext):
         file_id = m.audio.file_id; file_type = "audio"
     elif m.voice:
         file_id = m.voice.file_id; file_type = "voice"
+    elif m.sticker:
+        file_id = m.sticker.file_id
+        file_type = "sticker"
     await state.update_data(text=text, file_id=file_id, file_type=file_type)
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
@@ -795,16 +814,26 @@ async def finalize_newtask(m: types.Message, state: FSMContext, schedule: Dict[s
         await state.clear()
         return
 
-    task_id = await add_task(chats, text, file_id, file_type, schedule, created_by)
+    editing_id = data.get("editing_task_id")
+    if editing_id:
+        await delete_task(editing_id)
+        task_id = await add_task(chats, text, file_id, file_type, schedule, created_by)
+        msg = f"Задача #{task_id} обновлена.\n"
+    else:
+        task_id = await add_task(chats, text, file_id, file_type, schedule, created_by)
+        msg = f"Задача #{task_id} создана.\n"
+
     next_run = compute_next_run_from_schedule(schedule)
     next_run_str = next_run.strftime("%Y-%m-%d %H:%M") if next_run else "—"
+
     await m.reply(
-        f"Задача #{task_id} создана.\n"
+        msg +
         f"Расписание: {schedule_to_str(schedule)}\n"
         f"Следующий запуск: {next_run_str}",
         reply_markup=types.ReplyKeyboardRemove()
     )
     await state.clear()
+
 # -------------------- Tasks: список и действия --------------------
 @dp.message(Command("tasks"))
 async def cmd_tasks(m: types.Message):
@@ -879,6 +908,26 @@ async def cb_sendnow(call: types.CallbackQuery):
     await call.message.answer(f"Отправлено: {success}, Ошибок: {failed}")
     await call.answer("Отправлено сейчас")
 
+@dp.callback_query(F.data.startswith("edit:"))
+async def cb_edit_task(call: types.CallbackQuery, state: FSMContext):
+    task_id = int(call.data.split(":", 1)[1])
+    task = await get_task(task_id)
+    if not task:
+        return await call.answer("Задача не найдена", show_alert=True)
+
+    await state.update_data(editing_task_id=task_id)
+    await state.update_data(chats=task["chats"])
+    await state.update_data(text=task["text"])
+    await state.update_data(file_id=task["file_id"])
+    await state.update_data(file_type=task["file_type"])
+    await state.update_data(schedule=task["schedule"])
+
+    await call.message.answer("Пришли новый текст или медиа для задачи (оставь пустым, чтобы не менять):",
+                              reply_markup=cancel_kb())
+    await state.set_state(NewTask.entering_content)
+    await call.answer()
+
+
 # -------------------- Планировщик --------------------
 async def scheduler_loop():
     while True:
@@ -934,3 +983,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Stopped by user")
+
+
