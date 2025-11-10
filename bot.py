@@ -59,6 +59,8 @@ def combine_date_time(d: datetime.date, t: dtime) -> datetime:
 
 def schedule_to_str(sch: Dict[str, Any]) -> str:
     t = sch.get("type")
+    if t == "instant":
+        return "Instant (in ~1 minute)"
     if t == "once":
         return f"One-off at {sch.get('datetime')}"
     if t == "daily":
@@ -74,6 +76,7 @@ def schedule_to_str(sch: Dict[str, Any]) -> str:
     if t == "weekends":
         return f"Weekends at {sch.get('time')}"
     return json.dumps(sch)
+
 
 # -------------------- DB --------------------
 async def init_db():
@@ -269,6 +272,11 @@ def compute_next_run_from_schedule(schedule: Dict[str, Any], base_dt: Optional[d
         base_dt = now_trunc_min()
 
     ttype = schedule.get("type")
+
+    # --- NEW: instant ---
+    if ttype == "instant":
+        # Отправка примерно через минуту от точки расчета
+        return base_dt + timedelta(minutes=1)
 
     if ttype == "once":
         dt_str = schedule.get("datetime")
@@ -675,6 +683,7 @@ async def newtask_get_content(m: types.Message, state: FSMContext):
     await state.update_data(text=text, file_id=file_id, file_type=file_type)
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
+            [types.KeyboardButton(text="Отправить моментально (один раз)")],
             [types.KeyboardButton(text="Разово (один раз)")],
             [types.KeyboardButton(text="Ежедневно")],
             [types.KeyboardButton(text="Несколько раз в день")],
@@ -696,6 +705,9 @@ async def newtask_choose_schedule_type(m: types.Message, state: FSMContext):
         await m.reply("Введите дату и время: YYYY-MM-DD HH:MM (например: 2025-10-30 18:30)",
                       reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_once)
+    elif t == "Отправить моментально (один раз)":
+        schedule = {"type": "instant"}
+        await finalize_newtask(m, state, schedule)
     elif t == "Ежедневно":
         await m.reply("Введите время: HH:MM (например: 09:00)", reply_markup=cancel_kb())
         await state.set_state(NewTask.entering_daily)
@@ -975,6 +987,7 @@ async def edit_choose_action(m: types.Message, state: FSMContext):
     elif choice == "⏰ Редактировать время":
         kb = types.ReplyKeyboardMarkup(
             keyboard=[
+                [types.KeyboardButton(text="Отправить моментально (один раз)")],
                 [types.KeyboardButton(text="Разово (один раз)")],
                 [types.KeyboardButton(text="Ежедневно")],
                 [types.KeyboardButton(text="Несколько раз в день")],
@@ -1050,6 +1063,20 @@ async def edit_task_time_type(m: types.Message, state: FSMContext):
     if t == "Разово (один раз)":
         await m.reply("Введите дату и время: YYYY-MM-DD HH:MM", reply_markup=cancel_kb())
         await state.set_state(EditTask.editing_time)
+    elif t == "Отправить моментально (один раз)":
+        task_id = (await state.get_data())["editing_task_id"]
+        schedule = {"type": "instant"}
+
+        next_run = compute_next_run_from_schedule(schedule)
+        next_run_str = next_run.strftime("%Y-%m-%d %H:%M") if next_run else None
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE tasks SET schedule=?, next_run=? WHERE id=?",
+                            (json.dumps(schedule), next_run_str, task_id))
+            await db.commit()
+
+        await m.reply("Расписание обновлено: отправка через ~1 минуту ✅", reply_markup=types.ReplyKeyboardRemove())
+        await state.clear()
     elif t == "Ежедневно":
         await m.reply("Введите время: HH:MM", reply_markup=cancel_kb())
         await state.set_state(EditTask.editing_time)
@@ -1139,12 +1166,19 @@ async def edit_task_groups(m: types.Message, state: FSMContext):
         data = await state.get_data()
         task_id = data["editing_task_id"]
         task = await get_task(task_id)
-        chats = task["chats"]
+        task_chats = task["chats"]
 
-        text = "Список групп задачи:\n" + "\n".join(f"{i+1}. {c}" for i, c in enumerate(chats))
+        # подтягиваем названия из сохранённых чатов
+        all_chats = await list_chats()
+        chat_map = {c["identifier"]: c["title"] for c in all_chats}
+
+        text = "Список групп задачи:\n" + "\n".join(
+            f"{i+1}. {chat_map.get(c, c)} ({c})" for i, c in enumerate(task_chats)
+        )
         text += "\n\nОтправь номер группы для удаления."
         await m.reply(text, reply_markup=cancel_kb())
         await state.set_state(EditTask.removing_group)
+
 
     else:
         await m.reply("Отмена.", reply_markup=types.ReplyKeyboardRemove())
@@ -1237,13 +1271,16 @@ async def scheduler_loop():
                             ok, info = await send_message_to_chat(ch, text, file_id, file_type)
                             await log_send(task_id, ch, "ok" if ok else "error", info)
                         ttype = schedule.get("type")
-                        if ttype == "once":
+                        if ttype in ("once", "instant"):   # instant тоже одноразовая
                             await update_task_next_run(task_id, None)
                             await set_task_enabled(task_id, False)
                         else:
-                            nxt = compute_next_run_from_schedule(schedule,
-                                                                 base_dt=next_run_dt + timedelta(minutes=1))
+                            nxt = compute_next_run_from_schedule(
+                                schedule,
+                                base_dt=next_run_dt + timedelta(minutes=1)
+                            )
                             await update_task_next_run(task_id, nxt)
+
             await asyncio.sleep(20)
         except Exception as ex:
             print("Scheduler error:", ex)
